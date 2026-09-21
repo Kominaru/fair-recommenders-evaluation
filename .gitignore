@@ -1,0 +1,37 @@
+# Python cache and tooling
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local Python environments
+.venv/
+venv/
+env/
+
+# Local IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Profiling and generated experiment output
+*.prof
+mf_checkpoints/
+mf_balanced_conditions/
+mf_user_ratio_checkpoints/
+mf_user_ratio_diagnostics/
+
+# Generated result tables and exported balanced datasets
+mf_*.csv
+movielens-*.csv
+
+# Downloaded MovieLens data files
+movielens_data/*
+*.zip
+
+movielen

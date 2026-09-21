@@ -1,0 +1,8 @@
+certifi
+lightning
+matplotlib
+numpy
+pandas
+scikit-learn
+torch
+tqdm
