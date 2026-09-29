@@ -33,5 +33,3 @@ movielens-*.csv
 # Downloaded MovieLens data files
 movielens_data/*
 *.zip
-
-movielen

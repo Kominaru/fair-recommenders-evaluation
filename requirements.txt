@@ -3,6 +3,7 @@ lightning
 matplotlib
 numpy
 pandas
+scipy
 scikit-learn
 torch
 tqdm
