@@ -1070,6 +1070,195 @@ def balance_users(
     )
 
 
+def hybrid_balance_users(
+    ratings,
+    condition,
+    target_size,
+    target_size_ratio_tolerance=0.001,
+    activity_quantiles=10,
+    eccentricity_quantiles=10,
+    ratio_tolerance=1.001,
+    random_state=42,
+    max_passes=8,
+    max_swaps_per_pass=40,
+    protected_user_ids=None,
+):
+    """Balance users with frozen passes and complete-user reactivation swaps.
+
+    Each pass freezes activity/eccentricity bins for the current subset. A
+    bounded set of remove/add swaps is then scored using freshly recomputed
+    statistics. Only strictly improving swaps are retained, so accepted
+    objective values cannot increase, although global optimality is not
+    guaranteed.
+    """
+
+    if condition.name not in {"none", "all", "activity_eccentricity"}:
+        raise ValueError("Hybrid balancing supports none, all, and activity_eccentricity.")
+    if target_size < 0 or target_size > len(ratings):
+        raise ValueError("target_size must be within the rating count.")
+    if max_passes < 1 or max_swaps_per_pass < 1:
+        raise ValueError("max_passes and max_swaps_per_pass must be positive.")
+    if ratio_tolerance < 1:
+        raise ValueError("ratio_tolerance must be at least 1.")
+
+    protected_user_ids = set() if protected_user_ids is None else set(protected_user_ids)
+    all_user_ids = pd.Index(ratings["user_id"].unique())
+    unknown = protected_user_ids - set(all_user_ids)
+    if unknown:
+        raise ValueError("Protected users must occur in the ratings frame.")
+
+    minimum_size = int(np.ceil(target_size * (1 - target_size_ratio_tolerance)))
+    maximum_size = int(np.floor(target_size * (1 + target_size_ratio_tolerance)))
+    user_sizes = ratings.groupby("user_id").size()
+    protected_size = int(user_sizes.reindex(list(protected_user_ids), fill_value=0).sum())
+    if protected_size > maximum_size:
+        raise RuntimeError("Protected users exceed the requested target size.")
+
+    rng = np.random.default_rng(random_state)
+    retained = set(all_user_ids)
+    while len(ratings[ratings["user_id"].isin(retained)]) > maximum_size:
+        removable = list(retained - protected_user_ids)
+        if not removable:
+            raise RuntimeError("No removable users remain for the target size.")
+        removable.sort(key=lambda user_id: (user_sizes[user_id], rng.random()))
+        retained.remove(removable[0])
+
+    target_ratio = _target_ratio(ratings, condition.equal_groups)
+
+    def evaluate(user_ids):
+        subset = ratings[ratings["user_id"].isin(user_ids)].copy()
+        users = add_user_statistics(subset).reset_index(drop=True)
+        if condition.name == "none":
+            score = 0.0
+            stratum_deviation = 0.0
+            global_deviation = 0.0
+            singleton_count = 0
+        else:
+            activity_edges = _quantile_edges(users["activity"], activity_quantiles)
+            eccentricity_edges = _quantile_edges(users["eccentricity"], eccentricity_quantiles)
+            activity_bins = _make_fixed_bins(users["activity"].to_numpy(), activity_edges)
+            eccentricity_bins = _make_fixed_bins(users["eccentricity"].to_numpy(), eccentricity_edges)
+            if condition.name == "all":
+                strata = activity_bins * max(1, len(eccentricity_edges) - 1) + eccentricity_bins
+                target = 1.0
+                weights = np.ones(len(users), dtype=np.int64)
+            else:
+                strata = activity_bins * max(1, len(eccentricity_edges) - 1) + eccentricity_bins
+                target = target_ratio
+                weights = users["activity"].to_numpy(dtype=np.int64)
+            counts = np.zeros((int(strata.max()) + 1, 2), dtype=np.int64)
+            np.add.at(counts.ravel(), strata * 2 + (users["group"].to_numpy() == "B"), weights)
+            _, _, deviations = _deviations(counts, target, "multiplicative")
+            used = counts.sum(axis=1) > 0
+            shared = (counts[:, 0] > 0) & (counts[:, 1] > 0)
+            singleton_count = int(np.sum(used & ~shared))
+            finite_deviations = deviations[used & shared]
+            stratum_deviation = (
+                float(np.max(finite_deviations))
+                if len(finite_deviations)
+                else 0.0
+            )
+            group_counts = (
+                users["group"].value_counts()
+                if condition.name == "all"
+                else subset["group"].value_counts()
+            )
+            global_ratio = group_counts.get("A", 0) / max(group_counts.get("B", 0), 1)
+            global_target = 1.0 if condition.name == "all" else target_ratio
+            global_deviation = max(
+                global_ratio / global_target,
+                global_target / max(global_ratio, np.finfo(float).eps),
+            )
+            score = singleton_count + max(stratum_deviation, global_deviation)
+        return subset, score, stratum_deviation, global_deviation
+
+    subset, score, stratum_deviation, global_deviation = evaluate(retained)
+    best = (score, retained.copy(), subset, stratum_deviation, global_deviation)
+    seen = {frozenset(retained)}
+    total_swaps = 0
+    passes_used = 0
+
+    for pass_number in range(max_passes):
+        passes_used = pass_number + 1
+        current_users = add_user_statistics(subset).reset_index(drop=True)
+        active_ids = set(retained)
+        excluded_ids = set(all_user_ids) - active_ids
+        if condition.name == "none" or not excluded_ids:
+            break
+
+        activity_edges = _quantile_edges(current_users["activity"], activity_quantiles)
+        eccentricity_edges = _quantile_edges(current_users["eccentricity"], eccentricity_quantiles)
+        activity_bins = _make_fixed_bins(current_users["activity"].to_numpy(), activity_edges)
+        eccentricity_bins = _make_fixed_bins(current_users["eccentricity"].to_numpy(), eccentricity_edges)
+        bin_count = max(1, len(eccentricity_edges) - 1)
+        strata = activity_bins * bin_count + eccentricity_bins
+        target = 1.0 if condition.name == "all" else target_ratio
+        weights = np.ones(len(current_users), dtype=np.int64) if condition.name == "all" else current_users["activity"].to_numpy(dtype=np.int64)
+        counts = np.zeros((int(strata.max()) + 1, 2), dtype=np.int64)
+        np.add.at(counts.ravel(), strata * 2 + (current_users["group"].to_numpy() == "B"), weights)
+        _, _, deviations = _deviations(counts, target, "multiplicative")
+        worst_bins = np.argsort(np.where(counts.sum(axis=1), deviations, -np.inf))[::-1]
+        remove_ids = [
+            user_id for user_id, group, user_stratum in zip(
+                current_users["user_id"], current_users["group"], strata
+            )
+            if user_stratum in worst_bins[: min(10, len(worst_bins))]
+            and group == ("A" if counts[user_stratum, 0] > counts[user_stratum, 1] else "B")
+            and user_id not in protected_user_ids
+        ]
+        add_ids = list(excluded_ids)
+        rng.shuffle(remove_ids)
+        rng.shuffle(add_ids)
+        remove_ids = remove_ids[:20]
+        add_ids = add_ids[:20]
+        improved = False
+        for remove_id in remove_ids:
+            for add_id in add_ids:
+                candidate = active_ids - {remove_id} | {add_id}
+                candidate_size = int(user_sizes.reindex(list(candidate), fill_value=0).sum())
+                if not minimum_size <= candidate_size <= maximum_size:
+                    continue
+                candidate_subset, candidate_score, candidate_stratum, candidate_global = evaluate(candidate)
+                if candidate_score < score - 1e-12:
+                    retained = candidate
+                    subset = candidate_subset
+                    score = candidate_score
+                    stratum_deviation = candidate_stratum
+                    global_deviation = candidate_global
+                    active_ids = candidate
+                    total_swaps += 1
+                    improved = True
+                    if score < best[0]:
+                        best = (score, retained.copy(), subset, stratum_deviation, global_deviation)
+                    break
+            if improved:
+                break
+        if not improved or frozenset(retained) in seen:
+            break
+        seen.add(frozenset(retained))
+        if total_swaps >= max_swaps_per_pass * max_passes:
+            break
+
+    score, retained, subset, stratum_deviation, global_deviation = best
+    final_counts = subset["group"].value_counts().reindex(["A", "B"], fill_value=0)
+    return subset.reset_index(drop=True), {
+        "size": len(subset),
+        "users": int(subset["user_id"].nunique()),
+        "removed_users": int(len(all_user_ids) - subset["user_id"].nunique()),
+        "group_counts": final_counts,
+        "ratio": final_counts["A"] / max(final_counts["B"], 1),
+        "target_ratio": target_ratio,
+        "maximum_deviation": score,
+        "stratum_deviation": stratum_deviation,
+        "global_deviation": global_deviation,
+        "iterations": passes_used,
+        "swaps": total_swaps,
+        "converged": total_swaps == 0 or passes_used < max_passes,
+        "condition": condition.name,
+        "method": "hybrid_frozen_swap",
+    }
+
+
 def find_reference_size(ratings, **kwargs):
     """Find the largest strict all-criteria subset for one fold."""
 

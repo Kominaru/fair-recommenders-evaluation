@@ -1,0 +1,95 @@
+\begin{thebibliography}{10}
+
+\bibitem{abdollahpouri2017}
+Himan Abdollahpouri, Robin Burke, and Bamshad Mobasher.
+\newblock Controlling popularity bias in learning-to-rank recommendation.
+\newblock In {\em Proceedings of the ACM Conference on Recommender Systems},
+  pages 42--46, 2017.
+
+\bibitem{abdollahpouri2021}
+Himan Abdollahpouri, Maryam Mansoury, Robin Burke, Bamshad Mobasher, and Edward
+  Malthouse.
+\newblock User-centered evaluation of popularity bias in recommender systems.
+\newblock In {\em Proceedings of the ACM Conference on User Modeling,
+  Adaptation and Personalization}, pages 119--129, 2021.
+
+\bibitem{biega2018}
+Asia~J. Biega, Krishna~P. Gummadi, and Gerhard Weikum.
+\newblock Equity of attention: Amortizing individual fairness in rankings.
+\newblock In {\em Proceedings of the ACM SIGIR Conference}, pages 405--414,
+  2018.
+
+\bibitem{burke2017}
+Robin Burke.
+\newblock Multisided fairness for recommendation.
+\newblock {\em arXiv preprint arXiv:1707.00093}, 2017.
+
+\bibitem{celis2019}
+L.~Elisa Celis, Ling Huang, and Nisheeth~K. Vishnoi.
+\newblock Ranking with fairness constraints.
+\newblock In {\em Proceedings of the Conference on Fairness, Accountability,
+  and Transparency}, pages 57--68, 2019.
+
+\bibitem{dwork2012}
+Cynthia Dwork, Moritz Hardt, Toni Pitassi, Omer Reingold, and Richard Zemel.
+\newblock Fairness through awareness.
+\newblock In {\em Proceedings of the Innovations in Theoretical Computer
+  Science Conference}, pages 214--226, 2012.
+
+\bibitem{ekstrand2018}
+Michael~D. Ekstrand, Robin Burke, and Fernando Diaz.
+\newblock Fairness and discrimination in recommendation: A survey.
+\newblock {\em arXiv preprint}, 2018.
+
+\bibitem{gonzalez2022}
+Alvaro Gonzalez, Fernando Ortega, Diego Perez-Lopez, and Santiago Alonso.
+\newblock Bias and unfairness of collaborative filtering based recommender
+  systems in movielens dataset.
+\newblock {\em IEEE Access}, 10:68429--68439, 2022.
+
+\bibitem{hardt2016}
+Moritz Hardt, Eric Price, and Nati Srebro.
+\newblock Equality of opportunity in supervised learning.
+\newblock In {\em Advances in Neural Information Processing Systems},
+  volume~29, 2016.
+
+\bibitem{harper2015}
+F.~Maxwell Harper and Joseph~A. Konstan.
+\newblock The movielens datasets: History and context.
+\newblock {\em ACM Transactions on Interactive Intelligent Systems},
+  5(4):19:1--19:19, 2015.
+
+\bibitem{jannach2015}
+Dietmar Jannach, Lukas Lerche, Iman Kamehkhosh, and Marko Jugovac.
+\newblock What recommenders recommend: An analysis of recommendation biases and
+  possible countermeasures.
+\newblock {\em User Modeling and User-Adapted Interaction}, 25:427--491, 2015.
+
+\bibitem{kamishima2012}
+Toshihiro Kamishima, Saori Akter, Hideki Asoh, and Jun Sakuma.
+\newblock Fairness-aware classifier with prejudice remover regularizer.
+\newblock In {\em Proceedings of the European Conference on Machine Learning
+  and Principles and Practice of Knowledge Discovery in Databases}, pages
+  35--50, 2012.
+
+\bibitem{mehrabi2021}
+Ninareh Mehrabi, Fred Morstatter, Ninareh Saxena, Kristina Lerman, and Aram
+  Galstyan.
+\newblock A survey on bias and fairness in machine learning.
+\newblock {\em ACM Computing Surveys}, 54(6):115:1--115:35, 2021.
+
+\bibitem{pazruza2025}
+Jorge Paz-Ruza, Amparo Alonso-Betanzos, Bertha Guijarro-Berdiñas, Brais
+  Cancela, and Carlos Eiras-Franco.
+\newblock Beyond rmse and mae: Introducing eauc to unmask hidden bias and
+  unfairness in dyadic regression models.
+\newblock {\em arXiv preprint arXiv:2401.10690}, 2025.
+\newblock Version 5.
+
+\bibitem{singh2018}
+Ashudeep Singh and Thorsten Joachims.
+\newblock Fairness of exposure in rankings.
+\newblock In {\em Proceedings of the ACM SIGKDD Conference}, pages 2219--2228,
+  2018.
+
+\end{thebibliography}

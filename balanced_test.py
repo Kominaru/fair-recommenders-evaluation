@@ -1,4 +1,4 @@
-"""Train MF models after balancing test ratings using fixed training statistics."""
+"""Evaluate MF and baseline predictors under weighted test constructions."""
 
 import argparse
 from dataclasses import dataclass
@@ -96,68 +96,6 @@ def _group_ks_test(values, groups):
     return ks_2samp(group_a, group_b)
 
 
-def _sample_matching_histogram(frame, strata, random_state):
-    """Sample A and B with the same normalized histogram over strata."""
-
-    working = frame.copy()
-    working["_matching_stratum"] = strata
-    counts = pd.crosstab(working["_matching_stratum"], working["group"])
-    for group in ("A", "B"):
-        if group not in counts:
-            counts[group] = 0
-    counts = counts[["A", "B"]].sort_index()
-    shared = (counts["A"] > 0) & (counts["B"] > 0)
-    if not shared.any():
-        raise RuntimeError(
-            "No stratum contains ratings from both groups; matching the "
-            "group distributions is impossible."
-        )
-    counts = counts.loc[shared]
-    totals = counts.sum(axis=0)
-    normalized = counts.divide(totals, axis="columns")
-    common_shape = normalized.min(axis=1)
-    common_shape = common_shape / common_shape.sum()
-    target_totals = {
-        group: int(np.floor((counts[group] / common_shape).min()))
-        for group in ("A", "B")
-    }
-    target_counts = {}
-    for group in ("A", "B"):
-        raw_counts = target_totals[group] * common_shape
-        integer_counts = np.floor(raw_counts).astype(int)
-        remainder = target_totals[group] - int(integer_counts.sum())
-        if remainder:
-            fractional = (raw_counts - integer_counts).sort_values(
-                ascending=False
-            )
-            for stratum in fractional.index:
-                if remainder == 0:
-                    break
-                if integer_counts.loc[stratum] < counts.loc[stratum, group]:
-                    integer_counts.loc[stratum] += 1
-                    remainder -= 1
-        target_counts[group] = integer_counts
-    rng = np.random.default_rng(random_state)
-    retained_parts = []
-    for stratum in counts.index:
-        stratum_rows = working[working["_matching_stratum"] == stratum]
-        for group in ("A", "B"):
-            retained_parts.append(
-                stratum_rows[stratum_rows["group"] == group].sample(
-                    n=int(target_counts[group].loc[stratum]),
-                    random_state=rng,
-                )
-            )
-    balanced = pd.concat(retained_parts, axis=0).sort_index()
-    return balanced.drop(
-        columns=[column for column in balanced if column.startswith("_")]
-    ).reset_index(drop=True), {
-        "counts_before": counts.to_dict("index"),
-        "target_totals": target_totals,
-        "common_shape": common_shape.to_dict(),
-    }
-
-
 def _training_user_statistics(train_frame, test_frame):
 
     """Map fixed training activity statistics onto test users."""
@@ -217,6 +155,41 @@ def _training_rating_statistics(train_frame, test_frame):
     )
 
 
+def _stratum_importance_weights(frame, strata):
+    """Assign per-rating weights for a common A/B stratum distribution."""
+
+    working = frame.assign(_stratum=strata)
+    counts = pd.crosstab(working["_stratum"], working["group"])
+    counts = counts.reindex(columns=["A", "B"], fill_value=0).sort_index()
+    totals = counts.sum(axis=0)
+    normalized = counts.divide(totals.replace(0, np.nan), axis="columns")
+    shared = (counts["A"] > 0) & (counts["B"] > 0)
+    target = normalized.loc[shared, ["A", "B"]].min(axis=1)
+    if not target.sum():
+        return np.ones(len(working), dtype=float), {
+            "counts_before": counts.to_dict("index"),
+            "common_shape": {},
+            "zero_weight_ratings": 0,
+        }
+    target = target / target.sum()
+
+    weights = np.zeros(len(working), dtype=float)
+    for group in ("A", "B"):
+        group_mask = working["group"].to_numpy() == group
+        group_share = normalized[group]
+        valid = group_mask & working["_stratum"].isin(target.index).to_numpy()
+        weights[valid] = (
+            target.reindex(working.loc[valid, "_stratum"]).to_numpy()
+            / group_share.reindex(working.loc[valid, "_stratum"]).to_numpy()
+        )
+
+    return weights, {
+        "counts_before": counts.to_dict("index"),
+        "common_shape": target.to_dict(),
+        "zero_weight_ratings": int((weights == 0).sum()),
+    }
+
+
 def balance_test_ratings(
     train_frame,
     test_frame,
@@ -225,14 +198,7 @@ def balance_test_ratings(
     eccentricity_quantiles=10,
     random_state=42,
 ):
-    """Balance test ratings without changing training-derived user statistics.
-
-    For a selected condition, every shared fixed activity/eccentricity stratum
-    is sampled toward the eligible test set's overall A:B ratio. Integer
-    rounding is used for the sampled count, so the resulting ratios can differ
-    slightly. Strata containing only one group cannot satisfy the constraint
-    and are excluded.
-    """
+    """Reweight eligible test ratings without removing any test examples."""
 
     eligible_test, unavailable = _test_ratings_with_training_entities(
         train_frame, test_frame
@@ -243,10 +209,13 @@ def balance_test_ratings(
         raise RuntimeError("No test ratings belong to users present in training.")
 
     if condition.name == "none":
-        return eligible_test.reset_index(drop=True), {
-            "removed_ratings": unavailable_user_ratings + unavailable_item_ratings,
+        result = eligible_test.reset_index(drop=True)
+        result["test_weight"] = 1.0
+        return result, {
+            "excluded_ratings": unavailable_user_ratings + unavailable_item_ratings,
             "unavailable_user_ratings": unavailable_user_ratings,
             "unavailable_item_ratings": unavailable_item_ratings,
+            "zero_weight_ratings": 0,
             "strata": 1,
             "stratum_counts_before": {0: len(eligible_test)},
             "stratum_counts_after": {0: len(eligible_test)},
@@ -278,18 +247,18 @@ def balance_test_ratings(
     else:
         eccentricity_count = max(1, len(eccentricity_edges) - 1)
         strata = activity_bins * eccentricity_count + eccentricity_bins
-    balanced, matching_info = _sample_matching_histogram(
-        rating_frame, strata, random_state
-    )
-    return balanced, {
-        "removed_ratings": len(test_frame) - len(balanced),
+    weights, weighting_info = _stratum_importance_weights(rating_frame, strata)
+    result = eligible_test.reset_index(drop=True)
+    result["test_weight"] = weights
+    return result, {
+        "excluded_ratings": unavailable_user_ratings + unavailable_item_ratings,
         "unavailable_user_ratings": unavailable_user_ratings,
         "unavailable_item_ratings": unavailable_item_ratings,
-        "strata": len(matching_info["common_shape"]),
-        "stratum_counts_before": matching_info["counts_before"],
-        "stratum_counts_after": {},
-        "target_totals": matching_info["target_totals"],
-        "common_shape": matching_info["common_shape"],
+        "zero_weight_ratings": weighting_info["zero_weight_ratings"],
+        "strata": len(weighting_info["common_shape"]),
+        "stratum_counts_before": weighting_info["counts_before"],
+        "stratum_counts_after": weighting_info["common_shape"],
+        "common_shape": weighting_info["common_shape"],
     }
 
 def print_test_statistics(
@@ -345,6 +314,47 @@ def print_test_statistics(
     return {
         "activity_ks": activity_test.statistic,
         "eccentricity_ks": eccentricity_test.statistic,
+    }
+
+
+def evaluate_predictions(test_frame, predictions):
+    """Evaluate fixed predictions with the test frame's importance weights."""
+
+    actual = test_frame["rating"].to_numpy(dtype=float)
+    weights = test_frame["test_weight"].to_numpy(dtype=float)
+    groups = test_frame["group"].to_numpy()
+    errors = predictions - actual
+    total_weight = weights.sum()
+    group_rmse = {}
+    for group in ("A", "B"):
+        group_weights = weights[groups == group]
+        group_errors = errors[groups == group]
+        group_rmse[group] = np.sqrt(
+            np.sum(group_weights * group_errors**2) / group_weights.sum()
+        )
+    return {
+        "rmse": np.sqrt(np.sum(weights * errors**2) / total_weight),
+        "mae": np.sum(weights * np.abs(errors)) / total_weight,
+        "rmse_A": group_rmse["A"],
+        "rmse_B": group_rmse["B"],
+        # Positive EO means lower error for group A.
+        "eo_rmse": group_rmse["B"] - group_rmse["A"],
+    }
+
+
+def baseline_predictions(train_frame, test_frame, random_state):
+    """Return uniform-random and user/item-average test predictions."""
+
+    rng = np.random.default_rng(random_state)
+    user_means = train_frame.groupby("user_id")["rating"].mean()
+    item_means = train_frame.groupby("item_id")["rating"].mean()
+    average_prediction = (
+        test_frame["user_id"].map(user_means).to_numpy()
+        + test_frame["item_id"].map(item_means).to_numpy()
+    ) / 2
+    return {
+        "random_uniform": rng.uniform(1.0, 5.0, len(test_frame)),
+        "user_item_average": average_prediction,
     }
 
 
@@ -428,6 +438,11 @@ def parse_args():
         "--checkpoint-dir", type=Path, default=Path("mf_balanced_test")
     )
     parser.add_argument(
+        "--reuse-checkpoints",
+        action="store_true",
+        help="Reuse existing fold checkpoints instead of retraining identical MF models.",
+    )
+    parser.add_argument(
         "--results-file", type=Path, default=Path("mf_balanced_test.csv")
     )
     parser.add_argument("--quiet", action="store_true")
@@ -461,19 +476,25 @@ def run(args):
     ):
         train_frame = ratings.iloc[train_indices].copy()
         test_frame = ratings.iloc[test_indices].copy()
-        checkpoint_path = train_model(
-            train_frame=train_frame,
-            validation_frame=test_frame,
-            num_users=args.num_users,
-            num_items=args.num_items,
-            embedding_dim=args.embedding_dim,
-            learning_rate=args.learning_rate,
-            batch_size=args.batch_size,
-            max_epochs=args.max_epochs,
-            checkpoint_dir=args.checkpoint_dir / f"fold_{fold}",
-            early_stopping_patience=5,
-            quiet=True,
+        existing_checkpoint = (
+            args.checkpoint_dir / f"fold_{fold}" / "best.ckpt"
         )
+        if args.reuse_checkpoints and existing_checkpoint.exists():
+            checkpoint_path = str(existing_checkpoint)
+        else:
+            checkpoint_path = train_model(
+                train_frame=train_frame,
+                validation_frame=test_frame,
+                num_users=args.num_users,
+                num_items=args.num_items,
+                embedding_dim=args.embedding_dim,
+                learning_rate=args.learning_rate,
+                batch_size=args.batch_size,
+                max_epochs=args.max_epochs,
+                checkpoint_dir=args.checkpoint_dir / f"fold_{fold}",
+                early_stopping_patience=5,
+                quiet=True,
+            )
         for condition_name in args.conditions:
             condition = condition_map[condition_name]
             balanced_test, balance_info = balance_test_ratings(
@@ -498,38 +519,48 @@ def run(args):
                 test_frame=balanced_test,
                 batch_size=args.batch_size,
             )
-            metrics.update(
-                {
-                    "condition": condition.name,
-                    "fold": fold,
-                    "train_ratings": len(train_frame),
-                    "train_users": train_frame["user_id"].nunique(),
-                    "test_ratings": len(balanced_test),
-                    "test_users": balanced_test["user_id"].nunique(),
-                    "removed_test_ratings": balance_info["removed_ratings"],
-                    "unavailable_user_ratings": balance_info[
-                        "unavailable_user_ratings"
-                    ],
-                    "unavailable_item_ratings": balance_info[
-                        "unavailable_item_ratings"
-                    ],
-                    "test_strata": balance_info["strata"],
-                    "checkpoint": checkpoint_path,
-                    **distribution_metrics,
-                }
-            )
-            results.append(metrics)
+            common_metadata = {
+                "condition": condition.name,
+                "fold": fold,
+                "train_ratings": len(train_frame),
+                "train_users": train_frame["user_id"].nunique(),
+                "test_ratings": len(balanced_test),
+                "test_users": balanced_test["user_id"].nunique(),
+                "excluded_test_ratings": balance_info["excluded_ratings"],
+                "unavailable_user_ratings": balance_info[
+                    "unavailable_user_ratings"
+                ],
+                "unavailable_item_ratings": balance_info[
+                    "unavailable_item_ratings"
+                ],
+                "zero_weight_ratings": balance_info["zero_weight_ratings"],
+                "test_strata": balance_info["strata"],
+                "checkpoint": checkpoint_path,
+                **distribution_metrics,
+            }
+            results.append({**common_metadata, **metrics, "predictor": "mf"})
             print(
-                f"Fold {fold:2d} {condition.name:14s}: "
+                f"Fold {fold:2d} {condition.name:14s} MF: "
                 f"train={len(train_frame):,}, test={len(balanced_test):,}, "
                 f"EO={metrics['eo_rmse']:.3f}"
             )
+            for predictor, predictions in baseline_predictions(
+                train_frame, balanced_test, args.seed + fold
+            ).items():
+                baseline_metrics = evaluate_predictions(balanced_test, predictions)
+                results.append(
+                    {**common_metadata, **baseline_metrics, "predictor": predictor}
+                )
+                print(
+                    f"Fold {fold:2d} {condition.name:14s} {predictor}: "
+                    f"EO={baseline_metrics['eo_rmse']:.3f}"
+                )
 
     results = pd.DataFrame(results)
     results.to_csv(args.results_file, index=False)
     print(f"Saved results to {args.results_file}")
     print(
-        results.groupby("condition")[
+        results.groupby(["predictor", "condition"])[
             [
                 "rmse",
                 "mae",

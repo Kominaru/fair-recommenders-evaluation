@@ -6,6 +6,7 @@ import warnings
 logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
 
 import numpy as np
+import pandas as pd
 import torch
 import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
@@ -29,23 +30,30 @@ warnings.filterwarnings(
 class RatingsDataset(Dataset):
     """Expose indexed ratings as contiguous NumPy-backed samples."""
 
-    def __init__(self, frame):
+    def __init__(self, frame, include_weights=False):
         self.user_ids = frame["user_index"].to_numpy(dtype=np.int64, copy=False)
         self.item_ids = frame["item_index"].to_numpy(dtype=np.int64, copy=False)
         self.ratings = frame["rating"].to_numpy(dtype=np.float32, copy=False)
+        self.weights = (
+            frame.get("test_weight", pd.Series(1.0, index=frame.index))
+            .to_numpy(dtype=np.float32, copy=False)
+            if include_weights
+            else None
+        )
 
     def __len__(self):
         return len(self.ratings)
 
     def __getitem__(self, index):
-        return self.user_ids[index], self.item_ids[index], self.ratings[index]
+        values = self.user_ids[index], self.item_ids[index], self.ratings[index]
+        return values + (self.weights[index],) if self.weights is not None else values
 
 
-def make_dataloader(frame, batch_size, shuffle):
+def make_dataloader(frame, batch_size, shuffle, include_weights=False):
     """Create a data loader for an indexed ratings frame."""
 
     return DataLoader(
-        RatingsDataset(frame),
+        RatingsDataset(frame, include_weights=include_weights),
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=4,
@@ -66,19 +74,28 @@ def evaluate(model, data_loader, groups):
     batch_start = 0
 
     with torch.no_grad():
-        for user_ids, item_ids, batch_ratings in data_loader:
+        for batch in data_loader:
+            if len(batch) == 4:
+                user_ids, item_ids, batch_ratings, batch_weights = batch
+            else:
+                user_ids, item_ids, batch_ratings = batch
+                batch_weights = torch.ones_like(batch_ratings)
             user_ids = user_ids.to(model.device, non_blocking=True)
             item_ids = item_ids.to(model.device, non_blocking=True)
             batch_ratings = batch_ratings.to(model.device, non_blocking=True)
             errors = model(user_ids, item_ids) - batch_ratings
-            squared_error_sum += errors.square().sum().item()
-            absolute_error_sum += errors.abs().sum().item()
-            rating_count += len(batch_ratings)
+            batch_weights = batch_weights.to(errors.device, non_blocking=True)
+            squared_error_sum += (errors.square() * batch_weights).sum().item()
+            absolute_error_sum += (errors.abs() * batch_weights).sum().item()
+            rating_count += batch_weights.sum().item()
             batch_groups = groups[batch_start:batch_start + len(batch_ratings)]
             for group in ("A", "B"):
                 group_mask = torch.as_tensor(batch_groups == group, device=errors.device)
-                group_squared_error[group] += errors[group_mask].square().sum().item()
-                group_rating_count[group] += int(group_mask.sum().item())
+                group_weights = batch_weights[group_mask]
+                group_squared_error[group] += (
+                    errors[group_mask].square() * group_weights
+                ).sum().item()
+                group_rating_count[group] += group_weights.sum().item()
             batch_start += len(batch_ratings)
 
     group_rmse = {
@@ -90,7 +107,8 @@ def evaluate(model, data_loader, groups):
         "mae": absolute_error_sum / rating_count,
         "rmse_A": group_rmse["A"],
         "rmse_B": group_rmse["B"],
-        "eo_rmse": group_rmse["A"] - group_rmse["B"],
+        # Positive EO means lower error for group A.
+        "eo_rmse": group_rmse["B"] - group_rmse["A"],
     }
 
 
@@ -187,6 +205,6 @@ def evaluate_checkpoint(
     )
     return evaluate(
         model,
-        make_dataloader(test_frame, batch_size, False),
+        make_dataloader(test_frame, batch_size, False, include_weights=True),
         test_frame["group"].to_numpy(),
     )

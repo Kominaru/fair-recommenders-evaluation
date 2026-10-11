@@ -36,7 +36,13 @@ from balanced_subset import (
     CONDITIONS,
     balance_users,
     find_reference_size,
+    hybrid_balance_users,
     trim_users_to_size,
+)
+from balanced_test import (
+    TestBalanceCondition,
+    balance_test_ratings,
+    print_test_statistics,
 )
 from mf_train_eval import train_and_evaluate
 from dataset_loader import load_movielens_ratings
@@ -138,58 +144,6 @@ def print_data_summary(frame, label, reference_ratings=None):
     }
 
 
-def select_protected_users(
-    reference_train,
-    test_frame,
-    fraction,
-    activity_quantiles,
-    eccentricity_quantiles,
-    random_state,
-):
-    """Select a fixed, approximately stratified test-user cohort."""
-
-    if not 0 < fraction <= 1:
-        raise ValueError("protected fraction must be in (0, 1].")
-    test_user_ids = set(test_frame["user_id"])
-    users = add_user_statistics(reference_train)
-    users = users[users["user_id"].isin(test_user_ids)].copy()
-    if users.empty:
-        raise RuntimeError("No fully balanced users are present in the test fold.")
-    activity_edges = np.unique(
-        np.quantile(
-            users["activity"],
-            np.linspace(0, 1, activity_quantiles + 1),
-        )
-    )
-    eccentricity_edges = np.unique(
-        np.quantile(
-            users["eccentricity"],
-            np.linspace(0, 1, eccentricity_quantiles + 1),
-        )
-    )
-    users["activity_bin"] = np.searchsorted(
-        activity_edges[1:-1], users["activity"], side="right"
-    )
-    users["eccentricity_bin"] = np.searchsorted(
-        eccentricity_edges[1:-1], users["eccentricity"], side="right"
-    )
-    users["stratum"] = list(
-        zip(users["activity_bin"], users["eccentricity_bin"])
-    )
-    selected = []
-    for (_, group), group_users in users.groupby(["stratum", "group"]):
-        sample_size = int(np.floor(fraction * len(group_users)))
-        if sample_size == 0:
-            continue
-        selected.extend(
-            group_users.sort_values("user_id")["user_id"].head(sample_size).tolist()
-        )
-    protected = set(selected)
-    if not protected:
-        raise RuntimeError("Protected-user sampling produced an empty cohort.")
-    return protected
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Compare MF EO at each fold's minimal balanced size."
@@ -201,12 +155,6 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=2**14)
     parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--protected-fraction",
-        type=float,
-            default=0.2,
-        help="Fraction of eligible fully balanced users protected for testing.",
-    )
     parser.add_argument("--activity-quantiles", type=int, default=10)
     parser.add_argument("--eccentricity-quantiles", type=int, default=10)
     parser.add_argument("--ratio-tolerance", type=float, default=1.001)
@@ -217,6 +165,14 @@ def parse_args():
         help="Allowed relative deviation from the target rating count.",
     )
     parser.add_argument("--max-iterations", type=int, default=None)
+    parser.add_argument(
+        "--balancer",
+        choices=("dynamic", "hybrid"),
+        default="dynamic",
+        help="Train-side balancing algorithm.",
+    )
+    parser.add_argument("--hybrid-max-passes", type=int, default=8)
+    parser.add_argument("--hybrid-max-swaps-per-pass", type=int, default=40)
     parser.add_argument(
         "--conditions",
         type=parse_condition_names,
@@ -239,17 +195,29 @@ def train_condition(
     condition,
     fold,
     train_frame,
-    common_test,
+    test_frame,
     size,
     fallback_train,
-    protected_users,
 ):
-    if condition.name == "none":
+    if args.balancer == "hybrid":
+        balanced_train, balance_info = hybrid_balance_users(
+            train_frame,
+            condition,
+            target_size=size,
+            target_size_ratio_tolerance=args.target_size_ratio_tolerance,
+            activity_quantiles=args.activity_quantiles,
+            eccentricity_quantiles=args.eccentricity_quantiles,
+            ratio_tolerance=args.ratio_tolerance,
+            random_state=args.seed + fold,
+            max_passes=args.hybrid_max_passes,
+            max_swaps_per_pass=args.hybrid_max_swaps_per_pass,
+        )
+        used_fallback = False
+    elif condition.name == "none":
         balanced_train = trim_users_to_size(
             train_frame,
             size,
             random_state=args.seed + fold,
-            protected_user_ids=protected_users,
             target_size_ratio_tolerance=args.target_size_ratio_tolerance,
         )
         used_fallback = False
@@ -266,7 +234,6 @@ def train_condition(
                 ratio_tolerance=args.ratio_tolerance,
                 random_state=args.seed + fold,
                 max_iterations=args.max_iterations,
-                protected_user_ids=protected_users,
             )
         except RuntimeError:
             if condition.name == "activity_eccentricity":
@@ -283,24 +250,30 @@ def train_condition(
         .value_counts()
         .reindex(["A", "B"], fill_value=0)
     )
-    retained_users = set(balanced_train["user_id"])
-    missing_protected = protected_users - retained_users
-    if missing_protected:
-        raise RuntimeError(
-            f"Condition {condition.name} removed protected test users: "
-            f"{sorted(missing_protected)[:5]}"
-        )
+    balanced_test, test_info = balance_test_ratings(
+        balanced_train,
+        test_frame,
+        TestBalanceCondition("both", ("activity", "eccentricity")),
+        activity_quantiles=args.activity_quantiles,
+        eccentricity_quantiles=args.eccentricity_quantiles,
+        random_state=args.seed + fold,
+    )
     train_statistics = print_data_summary(
         balanced_train, f"Fold {fold} condition {condition.name}: train subset"
     )
     print_data_summary(
-        common_test,
+        balanced_test,
         f"Fold {fold} condition {condition.name}: evaluation subset",
         reference_ratings=balanced_train,
     )
+    print_test_statistics(
+        balanced_train,
+        balanced_test,
+        f"Fold {fold} condition {condition.name}: weighted evaluation set",
+    )
     metrics, checkpoint_path = train_and_evaluate(
         train_frame=balanced_train,
-        test_frame=common_test,
+        test_frame=balanced_test,
         num_users=args.num_users,
         num_items=args.num_items,
         embedding_dim=args.embedding_dim,
@@ -320,7 +293,7 @@ def train_condition(
             <= size * args.target_size_ratio_tolerance,
             "train_ratings": len(balanced_train),
             "train_users": balanced_train["user_id"].nunique(),
-            "test_ratings": len(common_test),
+            "test_ratings": len(balanced_test),
             "group_A_users": int(user_counts["A"]),
             "group_B_users": int(user_counts["B"]),
             "group_A_ratings": int(rating_counts["A"]),
@@ -328,14 +301,26 @@ def train_condition(
             "achieved_user_ratio": user_counts["A"] / max(user_counts["B"], 1),
             "achieved_rating_ratio": rating_counts["A"] / max(rating_counts["B"], 1),
             "fallback": used_fallback,
+            "train_balancer": args.balancer,
+            "train_balance_iterations": balance_info.get("iterations", 0)
+            if args.balancer == "hybrid"
+            else np.nan,
+            "train_balance_swaps": balance_info.get("swaps", 0)
+            if args.balancer == "hybrid"
+            else np.nan,
+            "train_balance_deviation": balance_info.get("maximum_deviation", np.nan)
+            if args.balancer == "hybrid"
+            else np.nan,
             "checkpoint": checkpoint_path,
-            "condition_test_ratings": len(common_test),
-            "common_test_users": common_test["user_id"].nunique(),
+            "condition_test_ratings": len(balanced_test),
+            "test_users": balanced_test["user_id"].nunique(),
+            "test_balance_excluded_ratings": test_info["excluded_ratings"],
+            "test_balance_zero_weight_ratings": test_info["zero_weight_ratings"],
             "train_activity_ks": train_statistics["activity_ks"],
             "train_eccentricity_ks": train_statistics["eccentricity_ks"],
         }
     )
-    return metrics, retained_users
+    return metrics, set(balanced_train["user_id"])
 
 
 def run(args):
@@ -373,28 +358,6 @@ def run(args):
             f"A:B={reference_info['ratio']:.4f}"
         )
         size = reference_info["size"]
-        protected_users = select_protected_users(
-            reference_train,
-            test_frame,
-            args.protected_fraction,
-            args.activity_quantiles,
-            args.eccentricity_quantiles,
-            args.seed + fold,
-        )
-        print(
-            f"Fold {fold:2d}: protected test users={len(protected_users):,} "
-            f"(fraction={args.protected_fraction:.3f})"
-        )
-        common_test = test_frame[
-            test_frame["user_id"].isin(protected_users)
-        ].copy()
-        if common_test.empty:
-            raise RuntimeError(f"Fold {fold} has no protected test ratings.")
-        print(
-            f"Fold {fold:2d}: common evaluation users="
-            f"{common_test['user_id'].nunique():,}, "
-            f"ratings={len(common_test):,}"
-        )
         fold_results = []
         for condition_name in args.conditions:
             metrics, retained_users = train_condition(
@@ -402,10 +365,9 @@ def run(args):
                 condition_map[condition_name],
                 fold,
                 train_frame,
-                common_test,
+                test_frame,
                 size,
                 reference_train,
-                protected_users,
             )
             fold_results.append(metrics)
 
@@ -418,19 +380,19 @@ def run(args):
             metrics.update(condition_metrics)
             metrics.update(
                 {
-                    "test_ratings": len(common_test),
-                    "common_rmse": metrics["rmse"],
-                    "common_mae": metrics["mae"],
-                    "common_rmse_A": metrics["rmse_A"],
-                    "common_rmse_B": metrics["rmse_B"],
-                    "common_eo_rmse": metrics["eo_rmse"],
+                    "test_ratings": metrics["test_ratings"],
+                    "weighted_test_rmse": metrics["rmse"],
+                    "weighted_test_mae": metrics["mae"],
+                    "weighted_test_rmse_A": metrics["rmse_A"],
+                    "weighted_test_rmse_B": metrics["rmse_B"],
+                    "weighted_test_eo_rmse": metrics["eo_rmse"],
                 }
             )
             results.append(metrics)
             print(
                 f"Fold {fold:2d} {metrics['condition']:24s}: "
                 f"N={metrics['train_ratings']:,}, "
-                f"EO(common)={metrics['eo_rmse']:.4f}, "
+                f"EO(weighted test)={metrics['eo_rmse']:.4f}, "
                 f"EO(condition)={metrics['condition_eo_rmse']:.4f}, "
                 f"fallback={metrics['fallback']}"
             )
