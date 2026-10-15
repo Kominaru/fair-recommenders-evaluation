@@ -10,8 +10,9 @@ CONDITIONS = ("none", "activity", "eccentricity", "both")
 CONSTRUCTION_LABELS = {
     "gender": "Gender",
     "age": "Age",
-    "artificial_activity": "Artificial activity",
-    "artificial_eccentricity": "Artificial eccentricity",
+    "artificial_activity": "Induced activity",
+    "artificial_eccentricity": "Induced eccentricity",
+    "placebo": "Placebo",
 }
 PREDICTOR_ORDER = ("mf", "random_uniform", "user_item_average")
 GROUPS = ("A", "B")
@@ -34,6 +35,9 @@ def parse_args():
 def load_results(input_dir):
     frames = []
     for construction in CONSTRUCTION_LABELS:
+        if construction == "placebo":
+            # Only produced by run_joint_decomposition.py.
+            continue
         if construction == "artificial_activity":
             candidates = (
                 input_dir / "mf_balanced_test_artificial_activity_300_400_sd200.csv",

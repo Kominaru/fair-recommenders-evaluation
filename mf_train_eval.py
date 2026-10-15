@@ -10,7 +10,13 @@ import pandas as pd
 import torch
 import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import (
+    BatchSampler,
+    DataLoader,
+    Dataset,
+    RandomSampler,
+    SequentialSampler,
+)
 
 from mf_model import MatrixFactorizationModel
 
@@ -28,37 +34,42 @@ warnings.filterwarnings(
 
 
 class RatingsDataset(Dataset):
-    """Expose indexed ratings as contiguous NumPy-backed samples."""
+    """Expose indexed ratings as tensors that are sliced one batch at a time."""
 
     def __init__(self, frame, include_weights=False):
-        self.user_ids = frame["user_index"].to_numpy(dtype=np.int64, copy=False)
-        self.item_ids = frame["item_index"].to_numpy(dtype=np.int64, copy=False)
-        self.ratings = frame["rating"].to_numpy(dtype=np.float32, copy=False)
-        self.weights = (
-            frame.get("test_weight", pd.Series(1.0, index=frame.index))
-            .to_numpy(dtype=np.float32, copy=False)
-            if include_weights
-            else None
-        )
+        columns = [
+            frame["user_index"].to_numpy(dtype=np.int64),
+            frame["item_index"].to_numpy(dtype=np.int64),
+            frame["rating"].to_numpy(dtype=np.float32),
+        ]
+        if include_weights:
+            columns.append(
+                frame.get("test_weight", pd.Series(1.0, index=frame.index))
+                .to_numpy(dtype=np.float32)
+            )
+        self.columns = [torch.tensor(column) for column in columns]
 
     def __len__(self):
-        return len(self.ratings)
+        return len(self.columns[0])
 
-    def __getitem__(self, index):
-        values = self.user_ids[index], self.item_ids[index], self.ratings[index]
-        return values + (self.weights[index],) if self.weights is not None else values
+    def __getitem__(self, indices):
+        return tuple(column[indices] for column in self.columns)
 
 
 def make_dataloader(frame, batch_size, shuffle, include_weights=False):
-    """Create a data loader for an indexed ratings frame."""
+    """Create a data loader that yields whole batches without worker processes.
 
+    Slicing in-memory tensors per batch is faster than collating single
+    samples in workers, and leaves the CPU to training when there is no GPU.
+    """
+
+    dataset = RatingsDataset(frame, include_weights=include_weights)
+    sampler = RandomSampler(dataset) if shuffle else SequentialSampler(dataset)
     return DataLoader(
-        RatingsDataset(frame, include_weights=include_weights),
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
+        dataset,
+        sampler=BatchSampler(sampler, batch_size=batch_size, drop_last=False),
+        batch_size=None,
+        pin_memory=torch.cuda.is_available(),
     )
 
 
@@ -138,7 +149,7 @@ def train_model(
         save_top_k=1,
     )
     trainer = L.Trainer(
-        accelerator="gpu",
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         max_epochs=max_epochs,
         callbacks=[
@@ -200,9 +211,8 @@ def evaluate_checkpoint(
 ):
     """Evaluate a saved MF checkpoint on an alternate test subset."""
 
-    model = MatrixFactorizationModel.load_from_checkpoint(checkpoint_path).to(
-        torch.device("cuda")
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MatrixFactorizationModel.load_from_checkpoint(checkpoint_path).to(device)
     return evaluate(
         model,
         make_dataloader(test_frame, batch_size, False, include_weights=True),

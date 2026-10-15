@@ -42,13 +42,79 @@ def _assign_artificial_groups(
     likelihood_a = np.exp(log_likelihood_a - maximum)
     likelihood_b = np.exp(log_likelihood_b - maximum)
     probability_a = likelihood_a / (likelihood_a + likelihood_b)
-    rng = np.random.default_rng(random_state)
-    users["group"] = np.where(
-        rng.random(len(users)) < probability_a,
-        "A",
-        "B",
-    )
+    if isinstance(random_state, np.ndarray):
+        uniforms = random_state
+    else:
+        uniforms = np.random.default_rng(random_state).random(len(users))
+    users["group"] = np.where(uniforms < probability_a, "A", "B")
     return users
+
+
+def induced_user_features(ratings):
+    """Per-user activity and mean rating eccentricity computed from ``ratings``."""
+
+    user_means = ratings.groupby("user_id")["rating"].mean()
+    item_means = ratings.groupby("item_id")["rating"].mean()
+    eccentricity = (
+        ratings["rating"]
+        - (ratings["user_id"].map(user_means) + ratings["item_id"].map(item_means)) / 2
+    ).abs()
+    return pd.DataFrame(
+        {
+            "activity": ratings.groupby("user_id")["rating"].size(),
+            "eccentricity": eccentricity.groupby(ratings["user_id"]).mean(),
+        }
+    )
+
+
+def induced_groups(
+    ratings,
+    user_ids,
+    group_by,
+    means,
+    standard_deviations,
+    random_state=42,
+):
+    """Induced A/B labels from features computed on ``ratings``.
+
+    Each user keeps one uniform draw, indexed by sorted user id, so labels
+    computed from different rating subsets (e.g. each fold's training data)
+    only differ for users whose assignment probability changes.
+    """
+
+    feature = {"artificial_activity": "activity", "artificial_eccentricity": "eccentricity"}[
+        group_by
+    ]
+    rng = np.random.default_rng(random_state)
+    user_ids = np.sort(np.unique(user_ids))
+    uniforms = pd.Series(rng.random(len(user_ids)), index=user_ids)
+    users = induced_user_features(ratings).reset_index(names="user_id")
+    users = _assign_artificial_groups(
+        users, feature, means, standard_deviations, uniforms.loc[users["user_id"]].to_numpy()
+    )
+    return users.set_index("user_id")["group"]
+
+
+def _load_grouped_ratings_file(path, group_by, random_state):
+    """Ratings that already carry an A/B group: columns user_id,item_id,rating,group.
+
+    ``group_by="gender"`` (or any real construction) uses the file's labels;
+    ``group_by="placebo"`` permutes the labels across users, keeping the group sizes.
+    """
+
+    ratings = pd.read_csv(path)
+    missing = {"user_id", "item_id", "rating", "group"} - set(ratings.columns)
+    if missing:
+        raise ValueError(f"{path} lacks columns {sorted(missing)}.")
+    if group_by == "placebo":
+        users = ratings.drop_duplicates("user_id")[["user_id", "group"]]
+        rng = np.random.default_rng(random_state)
+        permuted = pd.Series(rng.permutation(users["group"].to_numpy()), index=users["user_id"])
+        ratings["group"] = ratings["user_id"].map(permuted)
+    elif group_by not in {"gender", "age"}:
+        raise ValueError("A grouped ratings file supports group_by 'gender' (its own labels) or 'placebo'.")
+    ratings = ratings[ratings["group"].isin(["A", "B"])].copy()
+    return ratings[["user_id", "item_id", "rating", "group"]]
 
 
 def load_movielens_ratings(
@@ -64,7 +130,16 @@ def load_movielens_ratings(
     """Load MovieLens ratings and map the selected user attribute to A/B."""
 
     data_dir = Path(data_dir)
-    valid_groupings = {"gender", "age", "artificial_activity", "artificial_eccentricity"}
+    if data_dir.is_file():
+        return _load_grouped_ratings_file(data_dir, group_by, random_state)
+    valid_groupings = {
+        "gender",
+        "age",
+        "artificial_activity",
+        "artificial_eccentricity",
+        "placebo",
+        "placebo_age",
+    }
     if group_by not in valid_groupings:
         raise ValueError(f"group_by must be one of {sorted(valid_groupings)}.")
 
@@ -89,6 +164,21 @@ def load_movielens_ratings(
     )
     if group_by == "gender":
         ratings["group"] = ratings["gender"].map({"M": "A", "F": "B"})
+    elif group_by == "placebo":
+        # Gender labels permuted across users: same A:B ratio as gender, but
+        # unrelated to anything about the user.
+        rng = np.random.default_rng(random_state)
+        labels = users["gender"].map({"M": "A", "F": "B"}).to_numpy()
+        placebo = pd.Series(rng.permutation(labels), index=users["user_id"])
+        ratings["group"] = ratings["user_id"].map(placebo)
+    elif group_by == "placebo_age":
+        # Age labels permuted across users: the group sizes of the age
+        # construction (older users are the small group A), unrelated to
+        # anything about the user.
+        rng = np.random.default_rng(random_state)
+        labels = np.where(users["age"] > age_threshold, "A", "B")
+        placebo = pd.Series(rng.permutation(labels), index=users["user_id"])
+        ratings["group"] = ratings["user_id"].map(placebo)
     elif group_by == "age":
         ratings["group"] = np.where(
             ratings["age"] > age_threshold,
@@ -96,36 +186,20 @@ def load_movielens_ratings(
             "B",
         )
     else:
-        user_means = ratings.groupby("user_id")["rating"].mean()
-        item_means = ratings.groupby("item_id")["rating"].mean()
-        ratings["user_mean"] = ratings["user_id"].map(user_means)
-        ratings["item_mean"] = ratings["item_id"].map(item_means)
-        ratings["rating_eccentricity"] = (
-            ratings["rating"]
-            - (ratings["user_mean"] + ratings["item_mean"]) / 2
-        ).abs()
-        artificial_users = ratings.groupby("user_id", as_index=False).agg(
-            activity=("rating", "size"),
-            eccentricity=("rating_eccentricity", "mean"),
-        )
         if group_by == "artificial_activity":
-            artificial_users = _assign_artificial_groups(
-                artificial_users,
-                "activity",
-                artificial_activity_means,
-                artificial_activity_standard_deviations,
-                random_state,
-            )
+            means = artificial_activity_means
+            standard_deviations = artificial_activity_standard_deviations
         else:
-            artificial_users = _assign_artificial_groups(
-                artificial_users,
-                "eccentricity",
-                artificial_eccentricity_means,
-                artificial_eccentricity_standard_deviations,
-                random_state,
-            )
-        ratings = ratings.drop(
-            columns=["user_mean", "item_mean", "rating_eccentricity"]
-        ).merge(artificial_users[["user_id", "group"]], on="user_id")
+            means = artificial_eccentricity_means
+            standard_deviations = artificial_eccentricity_standard_deviations
+        groups = induced_groups(
+            ratings,
+            ratings["user_id"],
+            group_by,
+            means,
+            standard_deviations,
+            random_state,
+        )
+        ratings["group"] = ratings["user_id"].map(groups)
     ratings = ratings[ratings["group"].isin(["A", "B"])].copy()
     return ratings[["user_id", "item_id", "rating", "group"]]
