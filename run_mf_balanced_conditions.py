@@ -3,13 +3,12 @@
 import argparse
 import logging
 from pathlib import Path
+import time
 
 logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
 
-import lightning as L
 import numpy as np
 import pandas as pd
-import torch
 from sklearn.model_selection import KFold
 from scipy.stats import ks_2samp
 
@@ -35,16 +34,18 @@ logging.getLogger("lightning.pytorch.utilities.rank_zero").setLevel(
 from balanced_subset import (
     CONDITIONS,
     balance_users,
-    find_reference_size,
+    condition_cells,
     hybrid_balance_users,
-    trim_users_to_size,
+    thin_users_to_size,
+    user_strata,
 )
 from balanced_test import (
     TestBalanceCondition,
     balance_test_ratings,
     print_test_statistics,
+    standardize_test_ratings,
+    standardized_test_reference,
 )
-from mf_train_eval import train_and_evaluate
 from dataset_loader import load_movielens_ratings
 from user_balancing import add_user_statistics
 
@@ -149,12 +150,43 @@ def parse_args():
         description="Compare MF EO at each fold's minimal balanced size."
     )
     parser.add_argument("--original-data-dir", type=Path, default=Path("movielens_data/ml-1m"))
+    parser.add_argument(
+        "--group-by",
+        choices=(
+            "gender",
+            "age",
+            "artificial_activity",
+            "artificial_eccentricity",
+            "placebo",
+        ),
+        default="gender",
+        help="User-level A/B group construction.",
+    )
+    parser.add_argument("--age-threshold", type=int, default=45)
+    for feature, means, stds in (
+        ("activity", (300.0, 400.0), (200.0, 200.0)),
+        ("eccentricity", (0.65, 0.85), (0.15, 0.15)),
+    ):
+        parser.add_argument(
+            f"--artificial-{feature}-means",
+            type=float,
+            nargs=2,
+            default=means,
+            metavar=("A", "B"),
+        )
+        parser.add_argument(
+            f"--artificial-{feature}-stds",
+            type=float,
+            nargs=2,
+            default=stds,
+            metavar=("A", "B"),
+        )
     parser.add_argument("--folds", type=int, default=10)
     parser.add_argument("--embedding-dim", type=int, default=64)
     parser.add_argument("--max-epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=2**14)
     parser.add_argument("--learning-rate", type=float, default=0.001)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=727)
     parser.add_argument("--activity-quantiles", type=int, default=10)
     parser.add_argument("--eccentricity-quantiles", type=int, default=10)
     parser.add_argument("--ratio-tolerance", type=float, default=1.001)
@@ -165,6 +197,26 @@ def parse_args():
         help="Allowed relative deviation from the target rating count.",
     )
     parser.add_argument("--max-iterations", type=int, default=None)
+    parser.add_argument(
+        "--eccentricity-updates",
+        choices=("frozen", "dynamic"),
+        default="frozen",
+        help=(
+            "frozen: strata use each user's eccentricity on the full training "
+            "fold (Algorithm 1); dynamic: re-bin users as removals change it. "
+            "Thinning to the common size always uses the frozen strata."
+        ),
+    )
+    parser.add_argument(
+        "--evaluation",
+        choices=("standardized", "per-condition"),
+        default="standardized",
+        help=(
+            "standardized: weight every condition's test ratings to one joint "
+            "activity-eccentricity target fixed from the full training fold; "
+            "per-condition: rebuild the joint weighting from each subset."
+        ),
+    )
     parser.add_argument(
         "--balancer",
         choices=("dynamic", "hybrid"),
@@ -187,7 +239,155 @@ def parse_args():
         default=Path("mf_balanced_conditions_summary.csv"),
     )
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--balance-only",
+        action="store_true",
+        help="Build and check every training subset on CPU without training.",
+    )
+    parser.add_argument(
+        "--fold-limit",
+        type=int,
+        default=None,
+        help="Stop after this many folds.",
+    )
     return parser.parse_args()
+
+
+def balanced_bases(args, fold, train_frame):
+    """Return each condition's largest balanced subset for one fold."""
+
+    condition_map = {condition.name: condition for condition in CONDITIONS}
+    bases = {}
+    for name in args.conditions:
+        if name == "none":
+            bases[name] = train_frame
+            continue
+        bases[name], _ = balance_users(
+            train_frame,
+            condition_map[name],
+            activity_quantiles=args.activity_quantiles,
+            eccentricity_quantiles=args.eccentricity_quantiles,
+            ratio_tolerance=args.ratio_tolerance,
+            random_state=args.seed + fold,
+            max_iterations=args.max_iterations,
+            dynamic_eccentricity=args.eccentricity_updates == "dynamic",
+        )
+    return bases
+
+
+def build_training_subset(args, condition, fold, base, size, strata):
+    """Thin a condition's balanced subset to the common rating count.
+
+    Users are removed at random within each cell of group and balanced
+    strata, so the subset keeps its user ratio and balanced shape.
+    """
+
+    return thin_users_to_size(
+        base,
+        size,
+        condition_cells(strata, condition),
+        random_state=args.seed + fold,
+        target_size_ratio_tolerance=args.target_size_ratio_tolerance,
+    )
+
+
+def _group_distance(users, column):
+    """Total variation distance between the A and B user distributions."""
+
+    shares = pd.crosstab(users[column], users["group"], normalize="columns")
+    shares = shares.reindex(columns=["A", "B"], fill_value=0)
+    return 0.5 * float((shares["A"] - shares["B"]).abs().sum())
+
+
+def describe_condition(
+    args,
+    condition,
+    fold,
+    base,
+    size,
+    reference_condition,
+    test_reference,
+    features,
+):
+    """Build one training subset and report how well it meets its condition."""
+
+    start = time.perf_counter()
+    balanced_train = build_training_subset(
+        args, condition, fold, base, size, features
+    )
+    used_fallback = False
+    seconds = time.perf_counter() - start
+    users = features.loc[balanced_train["user_id"].unique()]
+    user_counts = users["group"].value_counts().reindex(["A", "B"], fill_value=0)
+    rating_counts = balanced_train["group"].value_counts().reindex(
+        ["A", "B"], fill_value=0
+    )
+    row = {
+        "construction": args.group_by,
+        "fold": fold,
+        "condition": condition.name,
+        "reference_size": size,
+        "balanced_ratings": len(base),
+        "reference_condition": reference_condition,
+        "train_ratings": len(balanced_train),
+        "size_matched": abs(len(balanced_train) - size)
+        <= size * args.target_size_ratio_tolerance,
+        "fallback": used_fallback,
+        "seconds": seconds,
+        "group_A_users": int(user_counts["A"]),
+        "group_B_users": int(user_counts["B"]),
+        "user_ratio": user_counts["A"] / max(user_counts["B"], 1),
+        "rating_ratio": rating_counts["A"] / max(rating_counts["B"], 1),
+        "activity_tvd": _group_distance(users, "activity_bin"),
+        "eccentricity_tvd": _group_distance(users, "eccentricity_bin"),
+        "joint_tvd": _group_distance(users, "joint_bin"),
+    }
+    if test_reference is not None:
+        evaluated, test_info = standardize_test_ratings(balanced_train, test_reference)
+        row.update(
+            {
+                "test_ratings": len(evaluated),
+                "test_users": evaluated["user_id"].nunique(),
+                "test_target_coverage_A": test_info["target_coverage_A"],
+                "test_target_coverage_B": test_info["target_coverage_B"],
+            }
+        )
+    print(
+        f"Fold {fold:2d} {condition.name:30s} N={len(balanced_train):,} "
+        f"users A:B={row['user_ratio']:.2f} ratings A:B={row['rating_ratio']:.2f} "
+        f"TVD act={row['activity_tvd']:.3f} ecc={row['eccentricity_tvd']:.3f} "
+        f"joint={row['joint_tvd']:.3f} (balanced N={len(base):,}, thinning {seconds:.1f}s)"
+    )
+    return row
+
+
+def summarize_balancing(results, results_file):
+    """Save per-fold balancing checks and print their means by condition."""
+
+    columns = [
+        "train_ratings",
+        "user_ratio",
+        "rating_ratio",
+        "activity_tvd",
+        "eccentricity_tvd",
+        "joint_tvd",
+        "seconds",
+    ]
+    columns += [
+        column
+        for column in ("test_users", "test_target_coverage_A", "test_target_coverage_B")
+        if column in results
+    ]
+    order = list(dict.fromkeys(results["condition"]))
+    summary = results.groupby("condition")[columns].mean().reindex(order)
+    summary["fallbacks"] = results.groupby("condition")["fallback"].sum()
+    summary["size_misses"] = (~results["size_matched"]).groupby(
+        results["condition"]
+    ).sum()
+    print("\nBalancing checks by condition (means across folds)")
+    print(summary.to_string(float_format=lambda value: f"{value:.3f}"))
+    results.to_csv(results_file, index=False)
+    print(f"Saved balancing checks to {results_file}")
 
 
 def train_condition(
@@ -197,7 +397,9 @@ def train_condition(
     train_frame,
     test_frame,
     size,
-    fallback_train,
+    base,
+    strata,
+    test_reference=None,
 ):
     if args.balancer == "hybrid":
         balanced_train, balance_info = hybrid_balance_users(
@@ -213,33 +415,11 @@ def train_condition(
             max_swaps_per_pass=args.hybrid_max_swaps_per_pass,
         )
         used_fallback = False
-    elif condition.name == "none":
-        balanced_train = trim_users_to_size(
-            train_frame,
-            size,
-            random_state=args.seed + fold,
-            target_size_ratio_tolerance=args.target_size_ratio_tolerance,
+    else:
+        balanced_train = build_training_subset(
+            args, condition, fold, base, size, strata
         )
         used_fallback = False
-    else:
-        used_fallback = False
-        try:
-            balanced_train, balance_info = balance_users(
-                train_frame,
-                condition,
-                target_size=size,
-                target_size_ratio_tolerance=args.target_size_ratio_tolerance,
-                activity_quantiles=args.activity_quantiles,
-                eccentricity_quantiles=args.eccentricity_quantiles,
-                ratio_tolerance=args.ratio_tolerance,
-                random_state=args.seed + fold,
-                max_iterations=args.max_iterations,
-            )
-        except RuntimeError:
-            if condition.name == "activity_eccentricity":
-                raise
-            balanced_train = fallback_train
-            used_fallback = True
     rating_counts = balanced_train["group"].value_counts().reindex(
         ["A", "B"], fill_value=0
     )
@@ -250,14 +430,19 @@ def train_condition(
         .value_counts()
         .reindex(["A", "B"], fill_value=0)
     )
-    balanced_test, test_info = balance_test_ratings(
-        balanced_train,
-        test_frame,
-        TestBalanceCondition("both", ("activity", "eccentricity")),
-        activity_quantiles=args.activity_quantiles,
-        eccentricity_quantiles=args.eccentricity_quantiles,
-        random_state=args.seed + fold,
-    )
+    if test_reference is not None:
+        balanced_test, test_info = standardize_test_ratings(
+            balanced_train, test_reference
+        )
+    else:
+        balanced_test, test_info = balance_test_ratings(
+            balanced_train,
+            test_frame,
+            TestBalanceCondition("both", ("activity", "eccentricity")),
+            activity_quantiles=args.activity_quantiles,
+            eccentricity_quantiles=args.eccentricity_quantiles,
+            random_state=args.seed + fold,
+        )
     train_statistics = print_data_summary(
         balanced_train, f"Fold {fold} condition {condition.name}: train subset"
     )
@@ -271,6 +456,8 @@ def train_condition(
         balanced_test,
         f"Fold {fold} condition {condition.name}: weighted evaluation set",
     )
+    from mf_train_eval import train_and_evaluate
+
     metrics, checkpoint_path = train_and_evaluate(
         train_frame=balanced_train,
         test_frame=balanced_test,
@@ -287,6 +474,7 @@ def train_condition(
     metrics.update(
         {
             "condition": condition.name,
+            "construction": args.group_by,
             "fold": fold,
             "target_size": size,
             "size_matched": abs(len(balanced_train) - size)
@@ -302,6 +490,7 @@ def train_condition(
             "achieved_rating_ratio": rating_counts["A"] / max(rating_counts["B"], 1),
             "fallback": used_fallback,
             "train_balancer": args.balancer,
+            "eccentricity_updates": args.eccentricity_updates,
             "train_balance_iterations": balance_info.get("iterations", 0)
             if args.balancer == "hybrid"
             else np.nan,
@@ -314,7 +503,10 @@ def train_condition(
             "checkpoint": checkpoint_path,
             "condition_test_ratings": len(balanced_test),
             "test_users": balanced_test["user_id"].nunique(),
-            "test_balance_excluded_ratings": test_info["excluded_ratings"],
+            "evaluation": args.evaluation,
+            "test_balance_excluded_ratings": test_info.get("excluded_ratings", np.nan),
+            "test_target_coverage_A": test_info.get("target_coverage_A", np.nan),
+            "test_target_coverage_B": test_info.get("target_coverage_B", np.nan),
             "test_balance_zero_weight_ratings": test_info["zero_weight_ratings"],
             "train_activity_ks": train_statistics["activity_ks"],
             "train_eccentricity_ks": train_statistics["eccentricity_ks"],
@@ -324,10 +516,22 @@ def train_condition(
 
 
 def run(args):
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required but is not available to PyTorch.")
-    L.seed_everything(args.seed, workers=True)
-    ratings = load_movielens_ratings(args.original_data_dir)
+    if not args.balance_only:
+        import lightning as L
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA GPU is required but is not available to PyTorch.")
+        L.seed_everything(args.seed, workers=True)
+    ratings = load_movielens_ratings(
+        args.original_data_dir,
+        group_by=args.group_by,
+        age_threshold=args.age_threshold,
+        artificial_activity_means=args.artificial_activity_means,
+        artificial_activity_standard_deviations=args.artificial_activity_stds,
+        artificial_eccentricity_means=args.artificial_eccentricity_means,
+        artificial_eccentricity_standard_deviations=args.artificial_eccentricity_stds,
+    )
     ratings["user_index"], user_ids = pd.factorize(ratings["user_id"], sort=True)
     ratings["item_index"], item_ids = pd.factorize(ratings["item_id"], sort=True)
     args.num_users = len(user_ids)
@@ -337,6 +541,8 @@ def run(args):
     results = []
     condition_map = {condition.name: condition for condition in CONDITIONS}
     for fold, (train_indices, test_indices) in enumerate(splitter.split(ratings), start=1):
+        if args.fold_limit is not None and fold > args.fold_limit:
+            break
         train_frame = ratings.iloc[train_indices].copy()
         test_frame = ratings.iloc[test_indices].copy()
         print_data_summary(train_frame, f"Fold {fold}: original train data")
@@ -345,19 +551,43 @@ def run(args):
             f"Fold {fold}: original test data",
             reference_ratings=train_frame,
         )
-        reference_train, reference_info = find_reference_size(
+        bases = balanced_bases(args, fold, train_frame)
+        reference_condition = min(bases, key=lambda name: len(bases[name]))
+        size = len(bases[reference_condition])
+        strata = user_strata(
             train_frame,
             activity_quantiles=args.activity_quantiles,
             eccentricity_quantiles=args.eccentricity_quantiles,
-            ratio_tolerance=args.ratio_tolerance,
-            random_state=args.seed + fold,
-            max_iterations=args.max_iterations,
         )
         print(
-            f"Fold {fold:2d}: strict reference size N={reference_info['size']:,}; "
-            f"A:B={reference_info['ratio']:.4f}"
+            f"Fold {fold:2d}: common reference size N={size:,} "
+            f"set by {reference_condition}"
         )
-        size = reference_info["size"]
+        test_reference = (
+            standardized_test_reference(
+                train_frame,
+                test_frame,
+                activity_quantiles=args.activity_quantiles,
+                eccentricity_quantiles=args.eccentricity_quantiles,
+            )
+            if args.evaluation == "standardized"
+            else None
+        )
+        if args.balance_only:
+            for condition_name in args.conditions:
+                results.append(
+                    describe_condition(
+                        args,
+                        condition_map[condition_name],
+                        fold,
+                        bases[condition_name],
+                        size,
+                        reference_condition,
+                        test_reference,
+                        strata,
+                    )
+                )
+            continue
         fold_results = []
         for condition_name in args.conditions:
             metrics, retained_users = train_condition(
@@ -367,7 +597,9 @@ def run(args):
                 train_frame,
                 test_frame,
                 size,
-                reference_train,
+                bases[condition_name],
+                strata,
+                test_reference,
             )
             fold_results.append(metrics)
 
@@ -398,12 +630,19 @@ def run(args):
             )
 
     results = pd.DataFrame(results)
+    if args.balance_only:
+        summarize_balancing(results, args.results_file)
+        return
     condition_labels = {
         "all": "Fully balanced",
         "none": "Resized (no balancing)",
     }
     global_summary = (
-        results.assign(condition=results["condition"].map(condition_labels))
+        results.assign(
+            condition=results["condition"].map(condition_labels).fillna(
+                results["condition"]
+            )
+        )
         .groupby("condition")[
             ["eo_rmse", "condition_eo_rmse", "rmse_A", "rmse_B"]
         ]

@@ -28,6 +28,11 @@ class BalanceCondition:
 
     global_rating_ratio: bool = False
 
+    # With balance_user_counts, target the original A:B user ratio instead of
+    # 1:1, so the condition aligns distributions without changing
+    # representation.
+    preserve_user_ratio: bool = False
+
 
 CONDITIONS = (
     BalanceCondition("none", (), False),
@@ -41,11 +46,25 @@ CONDITIONS = (
         True,
         True,
     ),
-    # BalanceCondition("activity_group", ("activity",), True),
-    # BalanceCondition("eccentricity_group", ("eccentricity",), True),
-    # BalanceCondition("activity", ("activity",), False),
-    # BalanceCondition("eccentricity", ("eccentricity",), False),
+    BalanceCondition("activity_group", ("activity",), True),
+    BalanceCondition("eccentricity_group", ("eccentricity",), True),
+    BalanceCondition("activity", ("activity",), False),
+    BalanceCondition("eccentricity", ("eccentricity",), False),
     BalanceCondition("group", (), True),
+    # Distribution-only conditions for the representation/activity/
+    # eccentricity lattice: user counts per stratum at the original ratio.
+    BalanceCondition(
+        "activity_aligned", ("activity",), False,
+        balance_user_counts=True, preserve_user_ratio=True,
+    ),
+    BalanceCondition(
+        "eccentricity_aligned", ("eccentricity",), False,
+        balance_user_counts=True, preserve_user_ratio=True,
+    ),
+    BalanceCondition(
+        "activity_eccentricity_aligned", ("activity", "eccentricity"), False,
+        balance_user_counts=True, preserve_user_ratio=True,
+    ),
 )
 
 
@@ -278,6 +297,58 @@ def _dynamic_swap_users(
         "Swap phase could not satisfy the requested constraints.")
 
 
+def _pair_deviation(count_a, count_b, target_ratio, ratio_mode):
+    count_a = np.asarray(count_a, dtype=float)
+    count_b = np.asarray(count_b, dtype=float)
+    shared = (count_a > 0) & (count_b > 0)
+    ratios = count_a / np.maximum(count_b, 1)
+    deviations = np.where((count_a > 0) | (count_b > 0), np.inf, 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if ratio_mode == "absolute":
+            balanced = np.abs(ratios - target_ratio)
+        else:
+            balanced = np.maximum(ratios / target_ratio, target_ratio / ratios)
+    return np.where(shared, balanced, deviations)
+
+
+def _size_fitting_removal(
+    counts,
+    strata,
+    groups,
+    candidate_mask,
+    weights,
+    target_ratio,
+    global_target_ratio,
+    ratio_mode,
+    priority,
+):
+    """Return the candidate whose removal leaves the smallest deviation."""
+
+    candidates = np.flatnonzero(candidate_mask)
+    if not candidates.size:
+        return None
+    weights = np.broadcast_to(np.asarray(weights), strata.shape)[candidates]
+    candidate_strata = strata[candidates]
+    candidate_groups = groups[candidates]
+    stratum_deviations = _pair_deviation(
+        counts[:, 0], counts[:, 1], target_ratio, ratio_mode
+    )
+    order = np.argsort(stratum_deviations)[::-1]
+    highest = stratum_deviations[order[0]]
+    second = stratum_deviations[order[1]] if len(order) > 1 else 0.0
+    other_maximum = np.where(candidate_strata == order[0], second, highest)
+    new_a = counts[candidate_strata, 0] - weights * (candidate_groups == 0)
+    new_b = counts[candidate_strata, 1] - weights * (candidate_groups == 1)
+    new_stratum = _pair_deviation(new_a, new_b, target_ratio, ratio_mode)
+    totals = counts.sum(axis=0)
+    global_a = totals[0] - weights * (candidate_groups == 0)
+    global_b = totals[1] - weights * (candidate_groups == 1)
+    new_global = _pair_deviation(global_a, global_b, global_target_ratio, ratio_mode)
+    scores = np.maximum(np.maximum(new_stratum, other_maximum), new_global)
+    best = np.lexsort((priority[candidates], scores))[0]
+    return int(candidates[best])
+
+
 def _balance_cached_users(
     ratings,
     condition,
@@ -290,6 +361,7 @@ def _balance_cached_users(
     random_state,
     max_iterations,
     protected_user_ids=None,
+    dynamic_eccentricity=True,
 ):
     """Balance one cached record per user while removing complete users."""
 
@@ -387,6 +459,10 @@ def _balance_cached_users(
 
     active = np.ones(len(users), dtype=bool)
 
+    # Fixed random priority so removals pick a random user within a stratum
+    # rather than the lowest user id.
+    removal_priority = rng.permutation(len(users))
+
     initial_item_means = item_sums[item_codes] / item_counts[item_codes]
 
     initial_deviations = np.abs(
@@ -453,7 +529,11 @@ def _balance_cached_users(
 
         np.add.at(counts.ravel(), strata * 2 + groups, 1)
 
-        target_ratio = 1.0
+        target_ratio = (
+            float((groups == 0).sum() / max((groups == 1).sum(), 1))
+            if condition.preserve_user_ratio
+            else 1.0
+        )
 
     else:
 
@@ -693,15 +773,24 @@ def _balance_cached_users(
 
                         continue
 
-                    group_code = (
+                    # A group-exclusive stratum is emptied of the group it
+                    # holds; comparing its A:B ratio with the target picks
+                    # the absent group whenever the target exceeds n_A.
+                    if not shared[candidate_stratum]:
 
-                        0
+                        group_code = int(counts[candidate_stratum, 0] == 0)
 
-                        if ratios[candidate_stratum] > target_ratio
+                    else:
 
-                        else 1
+                        group_code = (
 
-                    )
+                            0
+
+                            if ratios[candidate_stratum] > target_ratio
+
+                            else 1
+
+                        )
 
                     candidates = np.flatnonzero(
 
@@ -714,6 +803,10 @@ def _balance_cached_users(
                         & (groups == group_code)
 
                     )
+
+                    candidates = candidates[
+                        np.argsort(removal_priority[candidates])
+                    ]
 
                     for candidate in candidates:
 
@@ -757,11 +850,39 @@ def _balance_cached_users(
                         & (strata == candidate_stratum)
                         & (groups == group_code)
                     )
+                    if minimum_size is not None:
+                        candidates = candidates[
+                            active_rating_count - rating_counts[candidates]
+                            >= minimum_size
+                        ]
                     if candidates.size:
-                        removed_user = int(candidates[0])
+                        removed_user = int(
+                            candidates[np.argmin(removal_priority[candidates])]
+                        )
                         stratum = int(candidate_stratum)
                         counts = actual_counts
                         break
+
+            if removed_user is None and minimum_size is not None:
+
+                # Near the target size, every user of the most imbalanced
+                # stratum may be too large to remove. Fall back to the
+                # removable user from any stratum that leaves the subset
+                # most balanced.
+                removed_user = _size_fitting_removal(
+                    counts,
+                    strata,
+                    groups,
+                    active & ~protected
+                    & (active_rating_count - rating_counts >= minimum_size),
+                    1 if balance_user_counts else rating_counts,
+                    target_ratio,
+                    global_target_ratio,
+                    condition.ratio_mode,
+                    removal_priority,
+                )
+                if removed_user is not None:
+                    stratum = int(strata[removed_user])
 
             if removed_user is None:
 
@@ -860,7 +981,14 @@ def _balance_cached_users(
 
             counts[strata[removed_user], groups[removed_user]] -= removed_count
 
-            affected_array = np.flatnonzero(affected_mask & active)
+            # Frozen features keep each user's initial stratum, as in the
+            # report's Algorithm 1; dynamic updates re-bin users whose
+            # eccentricity changes as items lose ratings.
+            affected_array = (
+                np.flatnonzero(affected_mask & active)
+                if dynamic_eccentricity
+                else np.empty(0, dtype=np.int64)
+            )
 
             for item_code in removed_items:
 
@@ -1016,6 +1144,7 @@ def balance_users(
     random_state=42,
     max_iterations=None,
     protected_user_ids=None,
+    dynamic_eccentricity=True,
 ):
     """Create a subset by removing users under a selected condition.
 
@@ -1066,6 +1195,8 @@ def balance_users(
         max_iterations,
 
         protected_user_ids,
+
+        dynamic_eccentricity,
 
     )
 
@@ -1259,13 +1390,22 @@ def hybrid_balance_users(
     }
 
 
-def find_reference_size(ratings, **kwargs):
-    """Find the largest strict all-criteria subset for one fold."""
+def find_reference_size(ratings, condition_names=("all",), **kwargs):
+    """Find the common size every named condition can reach for one fold.
 
-    strict = next(
-        condition for condition in CONDITIONS if condition.name == "all")
+    Each condition's largest balanced subset is computed without a target
+    size; the smallest of them sets the reference, so all conditions can be
+    compared at one rating count. The default reproduces the strict
+    all-criteria reference.
+    """
 
-    return balance_users(ratings, strict, **kwargs)
+    condition_map = {condition.name: condition for condition in CONDITIONS}
+    best = None
+    for name in condition_names:
+        subset, info = balance_users(ratings, condition_map[name], **kwargs)
+        if best is None or info["size"] < best[1]["size"]:
+            best = subset, info
+    return best
 
 
 def trim_users_to_size(
@@ -1420,3 +1560,138 @@ def trim_users_to_size(
 
     return ratings[~ratings["user_id"].isin(
         removed_users)].copy().reset_index(drop=True)
+
+
+def user_strata(ratings, activity_quantiles=10, eccentricity_quantiles=10):
+    """Return each user's group and fixed activity/eccentricity strata.
+
+    The bins match the frozen strata ``balance_users`` builds for the same
+    ratings frame.
+    """
+
+    users = add_user_statistics(ratings).set_index("user_id")
+    for feature, quantiles in (
+        ("activity", activity_quantiles),
+        ("eccentricity", eccentricity_quantiles),
+    ):
+        edges = _quantile_edges(users[feature], quantiles)
+        users[f"{feature}_bin"] = _make_fixed_bins(users[feature].to_numpy(), edges)
+    users["joint_bin"] = (
+        users["activity_bin"] * (users["eccentricity_bin"].max() + 1)
+        + users["eccentricity_bin"]
+    )
+    return users
+
+
+def condition_cells(strata, condition):
+    """Label users by group and the strata their condition balances."""
+
+    cells = strata["group"].astype(str)
+    for dimension in condition.dimensions:
+        cells = cells + "_" + strata[f"{dimension}_bin"].astype(str)
+    return cells
+
+
+def thin_users_to_size(
+    ratings,
+    target_size,
+    cells,
+    random_state=42,
+    target_size_ratio_tolerance=0.001,
+    draws=200,
+    max_swaps=100,
+    max_batches=10,
+):
+    """Remove random complete users within each cell to reach a rating count.
+
+    Every cell keeps the same fraction of its users, so the subset keeps its
+    A:B user ratio and its balanced stratum shape while shrinking to
+    ``target_size``. Of ``draws`` random selections the closest to the target
+    is kept; within-cell swaps of a kept and a removed user then close any
+    remaining gap without changing cell counts. A batch that still misses the
+    size window is redrawn, up to ``max_batches`` times.
+    """
+
+    rng = np.random.default_rng(random_state)
+    user_sizes = ratings.groupby("user_id").size()
+    user_ids = user_sizes.index.to_numpy()
+    sizes = user_sizes.to_numpy(dtype=np.int64)
+    total = int(sizes.sum())
+    minimum_size = int(np.ceil(target_size * (1 - target_size_ratio_tolerance)))
+    maximum_size = int(np.floor(target_size * (1 + target_size_ratio_tolerance)))
+    if target_size > total:
+        raise ValueError("target_size exceeds the rating count.")
+    if minimum_size <= total <= maximum_size:
+        return ratings.copy()
+
+    cell_labels = pd.Series(cells).reindex(user_ids)
+    if cell_labels.isna().any():
+        raise ValueError("Every user needs a cell label.")
+    codes, _ = pd.factorize(cell_labels, sort=True)
+    cell_users = np.bincount(codes)
+
+    # Each cell keeps the target fraction of its users. Fractional counts
+    # are rounded at random per draw, which keeps cell shares unbiased and
+    # spreads removals over cells even when only a few users must go.
+    expected_keep = cell_users * (target_size / total)
+    floor_keep = np.floor(expected_keep).astype(np.int64)
+    remainders = expected_keep - floor_keep
+    cell_starts = np.concatenate(([0], np.cumsum(cell_users)[:-1]))
+    offsets = np.repeat(cell_starts, cell_users)
+
+    def swap_to_size(keep):
+        keep = keep.copy()
+        kept_size = int(sizes[keep].sum())
+        for _ in range(max_swaps):
+            if minimum_size <= kept_size <= maximum_size:
+                break
+            gap = kept_size - target_size
+            best = None
+            for code in range(len(cell_users)):
+                kept_users = np.flatnonzero((codes == code) & keep)
+                removed_users = np.flatnonzero((codes == code) & ~keep)
+                if not len(kept_users) or not len(removed_users):
+                    continue
+                removed_sorted = removed_users[np.argsort(sizes[removed_users])]
+                removed_sizes = sizes[removed_sorted]
+                # Swapping kept u for removed v changes the size by
+                # sizes[v] - sizes[u]; aim for -gap.
+                positions = np.searchsorted(removed_sizes, sizes[kept_users] - gap)
+                for offset in (0, -1):
+                    candidate = np.clip(positions + offset, 0, len(removed_sizes) - 1)
+                    remaining = np.abs(
+                        gap + removed_sizes[candidate] - sizes[kept_users]
+                    )
+                    index = int(np.argmin(remaining))
+                    if best is None or remaining[index] < best[0]:
+                        best = (
+                            int(remaining[index]),
+                            kept_users[index],
+                            removed_sorted[candidate[index]],
+                        )
+            if best is None or best[0] >= abs(gap):
+                break
+            _, kept_user, removed_user = best
+            keep[kept_user] = False
+            keep[removed_user] = True
+            kept_size += int(sizes[removed_user] - sizes[kept_user])
+        return keep, minimum_size <= kept_size <= maximum_size
+
+    for _ in range(max_batches):
+        best_keep, best_gap = None, None
+        for _ in range(draws):
+            kept_per_cell = floor_keep + (rng.random(len(cell_users)) < remainders)
+            order = np.lexsort((rng.random(len(sizes)), codes))
+            rank = np.empty(len(sizes), dtype=np.int64)
+            rank[order] = np.arange(len(sizes)) - offsets
+            keep = rank < kept_per_cell[codes]
+            gap = int(sizes[keep].sum()) - target_size
+            if best_gap is None or abs(gap) < abs(best_gap):
+                best_keep, best_gap = keep, gap
+        keep, reached = swap_to_size(best_keep)
+        if reached:
+            break
+    else:
+        raise RuntimeError("Within-cell thinning could not reach the target size.")
+    retained = set(user_ids[keep])
+    return ratings[ratings["user_id"].isin(retained)].reset_index(drop=True)

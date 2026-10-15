@@ -6,14 +6,11 @@ import logging
 from pathlib import Path
 import warnings
 logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
-import torch
-import lightning as L
 import numpy as np
 import pandas as pd
 from scipy.stats import ks_2samp
 
 
-import lightning as L
 import numpy as np
 import pandas as pd
 
@@ -40,7 +37,6 @@ logging.getLogger("lightning.pytorch.utilities.rank_zero").setLevel(
 from sklearn.model_selection import KFold
 
 from dataset_loader import load_movielens_ratings
-from mf_train_eval import evaluate_checkpoint, train_model
 from user_balancing import add_user_statistics
 
 
@@ -261,6 +257,171 @@ def balance_test_ratings(
         "common_shape": weighting_info["common_shape"],
     }
 
+TEST_POPULATIONS = ("none", "activity", "eccentricity", "both")
+
+
+def _user_training_eccentricity(train_frame, test_frame):
+    """Each test rating's user-level eccentricity e_u from training only.
+
+    Unlike the rating-level eccentricity, this does not use the test label.
+    """
+
+    user_means = train_frame.groupby("user_id")["rating"].mean()
+    item_means = train_frame.groupby("item_id")["rating"].mean()
+    eccentricity = (
+        train_frame["rating"]
+        - (
+            train_frame["user_id"].map(user_means)
+            + train_frame["item_id"].map(item_means)
+        )
+        / 2
+    ).abs()
+    user_eccentricity = eccentricity.groupby(train_frame["user_id"]).mean()
+    return test_frame["user_id"].map(user_eccentricity)
+
+
+def joint_test_reference(
+    train_frame,
+    test_frame,
+    activity_quantiles=10,
+    eccentricity_quantiles=10,
+    eccentricity="rating",
+):
+    """Fix joint test strata and the per-group target of every test population.
+
+    Statistics and pooled bin edges come from the full training fold and its
+    eligible test ratings, so every model is scored against the same
+    populations. For group g over joint strata s = (a, e) the targets are
+    ``none`` p_g(s), ``activity`` p_g(e | a) q_a, ``eccentricity``
+    p_g(a | e) q_e and ``both`` q_s, where q is the normalized minimum of the
+    two groups' shares over strata both groups occupy. On the full model these
+    reproduce ``balance_test_ratings`` for the same bins.
+
+    ``eccentricity="rating"`` stratifies on each test rating's eccentricity,
+    which uses its label; ``"user"`` stratifies on the user's mean training
+    eccentricity instead, a label-free covariate on the same scale as the
+    train-side strata.
+    """
+
+    eligible_test, _ = _test_ratings_with_training_entities(train_frame, test_frame)
+    statistics = _training_rating_statistics(train_frame, eligible_test)
+    if eccentricity == "user":
+        statistics["eccentricity"] = _user_training_eccentricity(
+            train_frame, eligible_test
+        )
+    elif eccentricity != "rating":
+        raise ValueError("eccentricity must be 'rating' or 'user'.")
+    activity_edges = _quantile_edges(
+        statistics["activity"].to_numpy(), activity_quantiles
+    )
+    eccentricity_edges = _quantile_edges(
+        statistics["eccentricity"].to_numpy(), eccentricity_quantiles
+    )
+    eccentricity_count = max(1, len(eccentricity_edges) - 1)
+    activity_bins = _fixed_bins(statistics["activity"].to_numpy(), activity_edges)
+    eccentricity_bins = _fixed_bins(
+        statistics["eccentricity"].to_numpy(), eccentricity_edges
+    )
+    strata = activity_bins * eccentricity_count + eccentricity_bins
+    eligible_test = eligible_test.assign(_stratum=strata)
+
+    shares = pd.crosstab(eligible_test["_stratum"], eligible_test["group"])
+    shares = shares.reindex(columns=["A", "B"], fill_value=0)
+    shares = shares / shares.sum(axis=0)
+    activity_of = pd.Series(shares.index // eccentricity_count, index=shares.index)
+    eccentricity_of = pd.Series(shares.index % eccentricity_count, index=shares.index)
+
+    def common(frame):
+        shared = (frame["A"] > 0) & (frame["B"] > 0)
+        target = frame.min(axis=1).where(shared, 0.0)
+        return target / target.sum()
+
+    targets = {"none": shares}
+    for name, factor in (("activity", activity_of), ("eccentricity", eccentricity_of)):
+        marginal = shares.groupby(factor).sum()
+        conditional = shares / marginal.reindex(factor).to_numpy()
+        common_marginal = common(marginal).reindex(factor).to_numpy()
+        targets[name] = (
+            conditional.multiply(common_marginal, axis=0)
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
+    joint = common(shares)
+    targets["both"] = pd.DataFrame({"A": joint, "B": joint})
+    return {"test": eligible_test, "targets": targets}
+
+
+def weight_test_population(model_train_frame, reference, population):
+    """Weight one model's evaluable test ratings to a fixed test population.
+
+    Only ratings whose user and item occur in ``model_train_frame`` can be
+    evaluated. Within each group they are reweighted so that their joint
+    stratum distribution equals the population's target; target strata that a
+    group no longer covers are dropped and the remaining target renormalized.
+    """
+
+    test = reference["test"]
+    evaluable = test[
+        test["user_id"].isin(set(model_train_frame["user_id"]))
+        & test["item_id"].isin(set(model_train_frame["item_id"]))
+    ]
+    if population == "both_own":
+        # Joint target rebuilt from this model's evaluable ratings, with the
+        # fixed bins: the per-condition alternative to the fixed target.
+        shares = pd.crosstab(evaluable["_stratum"], evaluable["group"])
+        shares = shares.reindex(columns=["A", "B"], fill_value=0)
+        shares = shares / shares.sum(axis=0)
+        shared = (shares["A"] > 0) & (shares["B"] > 0)
+        joint = shares.min(axis=1).where(shared, 0.0)
+        joint = joint / joint.sum()
+        target = pd.DataFrame({"A": joint, "B": joint})
+    else:
+        target = reference["targets"][population]
+    weights = np.zeros(len(evaluable), dtype=float)
+    coverage = {}
+    for group in ("A", "B"):
+        mask = (evaluable["group"] == group).to_numpy()
+        strata = evaluable.loc[mask, "_stratum"]
+        counts = strata.value_counts()
+        group_target = target[group][target[group] > 0]
+        covered = group_target[group_target.index.isin(counts.index)]
+        coverage[group] = float(covered.sum())
+        if covered.empty:
+            raise RuntimeError(f"Group {group} covers no target stratum.")
+        covered = covered / covered.sum()
+        shares = counts / counts.sum()
+        weights[mask] = (
+            covered.reindex(strata).fillna(0).to_numpy()
+            / shares.reindex(strata).to_numpy()
+        )
+    result = evaluable.drop(columns="_stratum").reset_index(drop=True)
+    result["test_weight"] = weights
+    return result, {
+        "zero_weight_ratings": int((weights == 0).sum()),
+        "target_coverage_A": coverage["A"],
+        "target_coverage_B": coverage["B"],
+    }
+
+
+def standardized_test_reference(
+    train_frame,
+    test_frame,
+    activity_quantiles=10,
+    eccentricity_quantiles=10,
+):
+    """Fixed test populations for scoring training conditions alike."""
+
+    return joint_test_reference(
+        train_frame, test_frame, activity_quantiles, eccentricity_quantiles
+    )
+
+
+def standardize_test_ratings(model_train_frame, reference):
+    """Weight one condition's evaluable test ratings to the joint target."""
+
+    return weight_test_population(model_train_frame, reference, "both")
+
+
 def print_test_statistics(
     train_frame,
     test_frame,
@@ -348,10 +509,15 @@ def baseline_predictions(train_frame, test_frame, random_state):
     rng = np.random.default_rng(random_state)
     user_means = train_frame.groupby("user_id")["rating"].mean()
     item_means = train_frame.groupby("item_id")["rating"].mean()
-    average_prediction = (
-        test_frame["user_id"].map(user_means).to_numpy()
-        + test_frame["item_id"].map(item_means).to_numpy()
-    ) / 2
+    user_part = test_frame["user_id"].map(user_means).to_numpy(dtype=float)
+    item_part = test_frame["item_id"].map(item_means).to_numpy(dtype=float)
+    # A rating of a user or item that the fit lacks (its only training rating
+    # was held out for validation) falls back to the other mean, then to the
+    # global mean; without this the group RMSE becomes NaN.
+    global_mean = train_frame["rating"].mean()
+    user_part = np.where(np.isnan(user_part), np.where(np.isnan(item_part), global_mean, item_part), user_part)
+    item_part = np.where(np.isnan(item_part), user_part, item_part)
+    average_prediction = (user_part + item_part) / 2
     return {
         "random_uniform": rng.uniform(1.0, 5.0, len(test_frame)),
         "user_item_average": average_prediction,
@@ -392,7 +558,7 @@ def parse_args():
         "--artificial-activity-means",
         type=float,
         nargs=2,
-        default=(200.0, 400.0),
+        default=(300.0, 400.0),
         metavar=("A", "B"),
         help="Target Normal means for artificial activity populations A and B.",
     )
@@ -400,7 +566,7 @@ def parse_args():
         "--artificial-activity-stds",
         type=float,
         nargs=2,
-        default=(50.0, 50.0),
+        default=(200.0, 200.0),
         metavar=("A", "B"),
         help="Normal standard deviations for artificial activity populations.",
     )
@@ -421,11 +587,11 @@ def parse_args():
         help="Normal standard deviations for artificial eccentricity populations.",
     )
     parser.add_argument("--folds", type=int, default=10)
-    parser.add_argument("--embedding-dim", type=int, default=64)
-    parser.add_argument("--max-epochs", type=int, default=20)
+    parser.add_argument("--embedding-dim", type=int, default=256)
+    parser.add_argument("--max-epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=2**14)
     parser.add_argument("--learning-rate", type=float, default=0.001)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=727)
     parser.add_argument("--activity-quantiles", type=int, default=10)
     parser.add_argument("--eccentricity-quantiles", type=int, default=10)
     parser.add_argument(
@@ -450,6 +616,11 @@ def parse_args():
 
 
 def run(args):
+    import lightning as L
+    import torch
+
+    from mf_train_eval import evaluate_checkpoint, train_model
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required but is not available to PyTorch.")
     L.seed_everything(args.seed, workers=True)

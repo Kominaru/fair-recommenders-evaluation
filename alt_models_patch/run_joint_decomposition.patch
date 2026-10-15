@@ -1,0 +1,84 @@
+--- run_joint_decomposition.orig.py	2026-10-13 07:52:17.676489196 +0000
++++ run_joint_decomposition.py	2026-10-13 07:52:17.692938132 +0000
+@@ -54,6 +54,8 @@
+ )
+ 
+ PREDICTORS = ("mf", "user_item_average", "random_uniform")
++# Opt-in non-factorization models (alt_models.py); not part of the default set.
++ALT_PREDICTORS = ("glocal_k", "gcmc")
+ # name -> (eccentricity definition, bins, scored for every training set)
+ TEST_VARIANTS = {
+     "rating10": ("rating", 10, True),
+@@ -175,7 +177,7 @@
+     )
+     parser.add_argument(
+         "--predictors",
+-        type=parse_list(PREDICTORS),
++        type=parse_list(PREDICTORS + ALT_PREDICTORS),
+         default=PREDICTORS,
+         help="Comma-separated predictors to fit on every training set.",
+     )
+@@ -196,6 +198,9 @@
+         action="store_true",
+         help="Keep MF checkpoints after scoring (about 30 MB each).",
+     )
++    parser.add_argument("--glocal-pretrain-epochs", type=int, default=3)
++    parser.add_argument("--glocal-finetune-epochs", type=int, default=6)
++    parser.add_argument("--gcmc-max-epochs", type=int, default=150)
+     parser.add_argument("--quiet", action="store_true")
+     args = parser.parse_args(argv)
+     args.conditions = tuple(LATTICE.values())
+@@ -404,6 +409,41 @@
+     return rows
+ 
+ 
++def score_alt(args, fold, name, training, fit, validation, frames, num_users, num_items):
++    """Train a non-factorization model (GLocal-K or GC-MC) and score every frame."""
++
++    import lightning as L
++    import torch
++
++    from alt_models import train_alt_model
++    from mf_train_eval import evaluate, make_dataloader
++
++    options = {
++        "glocal_k": dict(
++            pretrain_epochs=args.glocal_pretrain_epochs,
++            finetune_epochs=args.glocal_finetune_epochs,
++        ),
++        "gcmc": dict(max_epochs=args.gcmc_max_epochs),
++    }[name]
++    seeds = args.noise_seeds if training in {"full", "none"} else 1
++    rows = []
++    for seed_index in range(seeds):
++        L.seed_everything(args.seed + 1000 * fold + seed_index, workers=True)
++        model = train_alt_model(
++            name, fit, validation, num_users, num_items, quiet=args.quiet, **options
++        )
++
++        def predict(frame):
++            return evaluate(
++                model,
++                make_dataloader(frame, args.batch_size, False, include_weights=True),
++                frame["group"].to_numpy(),
++            )
++
++        rows += [{"predictor": name, "seed": seed_index, **row} for row in score(frames, predict)]
++    return rows
++
++
+ def run(args):
+     if "mf" in args.predictors:
+         import torch
+@@ -464,6 +504,11 @@
+                 rows += score_mf(
+                     args, fold, training, fit, validation, frames, num_users, num_items
+                 )
++            for name in ALT_PREDICTORS:
++                if name in args.predictors:
++                    rows += score_alt(
++                        args, fold, name, training, fit, validation, frames, num_users, num_items
++                    )
+             diagnostics = describe_training(train_subset, strata)
+             for row in rows:
+                 row.update(
